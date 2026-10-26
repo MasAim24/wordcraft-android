@@ -1,0 +1,17 @@
+{
+  "name": "wordcraft-android",
+  "productName": "WordCraft",
+  "version": "0.11.0",
+  "description": "WordCraft (Pure Rust + egui + WebAssembly) packaged as a native Android APK via Capacitor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/prepare-dist.mjs",
+    "setup:android": "node scripts/setup-android.mjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/cli": "^7.0.0",
+    "@capacitor/core": "^7.0.0"
+  }
+}
