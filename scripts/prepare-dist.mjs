@@ -7,6 +7,21 @@ const DIST = path.join(ROOT, 'dist');
 const VERSION = process.env.WORDCRAFT_VERSION || '0.11.0';
 const RELEASE_URL = `https://github.com/storytold/wordcraft/releases/download/v${VERSION}/wordcraft-web-${VERSION}.zip`;
 
+const ARABIC_FONTS = [
+  {
+    name: 'NotoSansArabic-Regular.ttf',
+    url: 'https://raw.githubusercontent.com/storytold/craft-fonts/main/fonts/noto-sans-arabic/NotoSansArabic.ttf'
+  },
+  {
+    name: 'Amiri-Regular.ttf',
+    url: 'https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf'
+  },
+  {
+    name: 'Amiri-Bold.ttf',
+    url: 'https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Bold.ttf'
+  }
+];
+
 function hasWasm(dir) {
   if (!fs.existsSync(dir)) return false;
   return fs.readdirSync(dir).some((f) => f.endsWith('.wasm'));
@@ -36,12 +51,32 @@ if (!hasWasm(DIST)) {
   console.log('✅ WordCraft Web WASM bundle already exists in dist/');
 }
 
-// 2. Write Android Mobile Bridge script (DPI-aware UI Scale, Top Safe Margin toggle, Virtual Keyboard, File Save & Share)
+// 2. Bundle Arabic fonts (Noto Sans Arabic + Amiri Regular/Bold) into dist/fonts/
+//    (Upstream wasm32 build skips embedding non-Georgian craft-fonts in crates/fonts/build.rs;
+//     pre-seeding them into IndexedDB "wordcraft" -> "fonts" makes FontDb::global() load them at startup!)
+const distFontsDir = path.join(DIST, 'fonts');
+fs.mkdirSync(distFontsDir, { recursive: true });
+for (const font of ARABIC_FONTS) {
+  const dest = path.join(distFontsDir, font.name);
+  const localCache = path.join(ROOT, 'fonts', font.name);
+  if (!fs.existsSync(dest)) {
+    if (fs.existsSync(localCache)) {
+      fs.copyFileSync(localCache, dest);
+      console.log(`✅ Copied cached ${font.name} to dist/fonts/`);
+    } else {
+      console.log(`⬇️ Downloading ${font.name}...`);
+      execSync(`curl -fSL -o "${dest}" "${font.url}"`, { stdio: 'inherit' });
+    }
+  }
+}
+
+// 3. Write Android Mobile Bridge script (Arabic Font Preloader, DPI-aware UI Scale, Top Safe Margin, Virtual Keyboard, File Save & Share)
 const mobileBridgeCode = `/**
- * WordCraft Android Mobile Bridge v2
- * - Fixes DPI scaling: WordCraft's uiScale is in physical pixels (pct / 100 / devicePixelRatio),
- *   so relative percentages must be multiplied by window.devicePixelRatio!
- * - Adds a toggleable Top Safe Margin ("⬇️ Atas") so the top menu/Ribbon is never blocked by status bar / camera cutout
+ * WordCraft Android Mobile Bridge v3
+ * - Pre-seeds Noto Sans Arabic & Amiri into WordCraft's IndexedDB ("wordcraft" -> "fonts") BEFORE WASM boots
+ *   so Arabic text & IME preedit render with full cursive shaping instead of tofu boxes
+ * - Fixes DPI scaling: WordCraft's uiScale is in physical pixels (pct / 100 / devicePixelRatio)
+ * - Adds a toggleable Top Safe Margin ("⬇️ Atas") so the top menu/Ribbon is never blocked by status bar
  * - Polyfills window.showSaveFilePicker for Android WebView
  */
 (function () {
@@ -53,13 +88,67 @@ const mobileBridgeCode = `/**
   const REL_SCALE_KEY = 'wordcraft.android.relScale';
   const dpr = Math.max(1, window.devicePixelRatio || 1);
 
-  // Convert a relative UI scale (e.g. 75%, 85%, 100%) to WordCraft's physical-pixel uiScale (50..300 or "auto")
+  // Preload bundled Arabic fonts into IndexedDB ("wordcraft" -> objectStore "fonts") as Uint8Array
+  // Matches apps/wordcraft-web/src/web/font_store.rs exactly
+  window.__wordcraftPreloadFonts = async function () {
+    const BUNDLED_ARABIC_FONTS = [
+      'NotoSansArabic-Regular.ttf',
+      'Amiri-Regular.ttf',
+      'Amiri-Bold.ttf'
+    ];
+    if (!window.indexedDB) return;
+
+    const db = await new Promise((resolve, reject) => {
+      const req = window.indexedDB.open('wordcraft', 1);
+      req.onupgradeneeded = () => {
+        const d = req.result;
+        if (!d.objectStoreNames.contains('fonts')) {
+          d.createObjectStore('fonts');
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+
+    const existingKeys = await new Promise((resolve) => {
+      try {
+        const tx = db.transaction('fonts', 'readonly');
+        const store = tx.objectStore('fonts');
+        const req = store.getAllKeys();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => resolve([]);
+      } catch (_) {
+        resolve([]);
+      }
+    });
+
+    for (const fontName of BUNDLED_ARABIC_FONTS) {
+      if (existingKeys.includes(fontName)) continue;
+      try {
+        const resp = await fetch('./fonts/' + fontName);
+        if (!resp.ok) continue;
+        const buf = await resp.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        await new Promise((resolve) => {
+          const tx = db.transaction('fonts', 'readwrite');
+          const store = tx.objectStore('fonts');
+          const req = store.put(bytes, fontName);
+          req.onsuccess = () => resolve(true);
+          req.onerror = () => resolve(false);
+        });
+        console.info('[WordCraft Android] Pre-installed font into IndexedDB:', fontName);
+      } catch (e) {
+        console.warn('[WordCraft Android] Failed to preload font:', fontName, e);
+      }
+    }
+    db.close();
+  };
+
   function toWordcraftScale(relPct) {
     if (relPct === 100) return 'auto';
     return Math.min(300, Math.max(50, Math.round(relPct * dpr)));
   }
 
-  // Migrate/initialize UI scale so it isn't tiny on high-DPI mobile screens
   try {
     let savedRel = parseInt(localStorage.getItem(REL_SCALE_KEY) || '', 10);
     let rawPrefs = {};
@@ -69,19 +158,16 @@ const mobileBridgeCode = `/**
       rawPrefs = {};
     }
 
-    // If previous v1 bridge wrote unscaled 75/85/100/115 on a high-DPI phone, fix it automatically
     if (!savedRel || (typeof rawPrefs.uiScale === 'number' && rawPrefs.uiScale <= 115 && dpr > 1.5)) {
-      savedRel = 80; // 80% relative to native Android DPI: crisp, readable, and fits Ribbon nicely
+      savedRel = 80;
       localStorage.setItem(REL_SCALE_KEY, String(savedRel));
       rawPrefs.uiScale = toWordcraftScale(savedRel);
       localStorage.setItem(PREF_KEY, JSON.stringify(rawPrefs));
     }
   } catch (_) {}
 
-  // Apply Top Safe Margin so the top Title Bar & File/Home/Insert tabs are never blocked by Android status bar
   function getTopOffset() {
     const val = localStorage.getItem(TOP_OFFSET_KEY);
-    // Default to 28px safe top offset on mobile so top menu is always 100% clickable
     return val === null ? 28 : (parseInt(val, 10) || 0);
   }
 
@@ -113,7 +199,6 @@ const mobileBridgeCode = `/**
     window.dispatchEvent(new Event('resize'));
   }
 
-  // Toast helper for saved/exported files
   function showSaveToast(filename, bytes, mime) {
     let old = document.getElementById('wc-mobile-toast');
     if (old) old.remove();
@@ -223,14 +308,13 @@ const mobileBridgeCode = `/**
     };
   }
 
-  // Build Floating Mobile Control Pill
   window.addEventListener('DOMContentLoaded', () => {
     applyTopOffset(getTopOffset());
 
     const bar = document.createElement('div');
     bar.id = 'wc-mobile-pill';
     bar.style.cssText = [
-      'position:fixed;right:10px;bottom:24px;z-index:99998;',
+      'position:fixed;right:10px;bottom:34px;z-index:99998;',
       'display:flex;align-items:center;gap:5px;background:rgba(15,23,42,0.86);',
       'backdrop-filter:blur(8px);padding:5px 8px;border-radius:999px;',
       'border:1px solid rgba(255,255,255,0.18);box-shadow:0 4px 14px rgba(0,0,0,0.35);',
@@ -242,7 +326,6 @@ const mobileBridgeCode = `/**
       'padding:5px 9px;font:600 11px system-ui,sans-serif;cursor:pointer;'
     ].join('');
 
-    // 1. Virtual Keyboard button
     const kbBtn = document.createElement('button');
     kbBtn.textContent = '⌨️ Ketik';
     kbBtn.style.cssText = btnStyle;
@@ -258,7 +341,6 @@ const mobileBridgeCode = `/**
       }
     };
 
-    // 2. Relative DPI UI Scale cycle button (65% -> 80% -> 90% -> 100%)
     const scaleBtn = document.createElement('button');
     const scales = [65, 80, 90, 100];
     function getSavedRelScale() {
@@ -280,7 +362,6 @@ const mobileBridgeCode = `/**
       } catch (_) {}
     };
 
-    // 3. Top Margin Safe-Area toggle (0px -> 28px -> 42px) so top menu is never covered by status bar
     const topBtn = document.createElement('button');
     const offsets = [0, 28, 42];
     function updateTopBtnLabel() {
@@ -289,7 +370,6 @@ const mobileBridgeCode = `/**
     }
     updateTopBtnLabel();
     topBtn.style.cssText = btnStyle;
-    topBtn.title = 'Geser menu atas agar tidak tertutup status bar / poni kamera';
     topBtn.onclick = (e) => {
       e.stopPropagation();
       const cur = getTopOffset();
@@ -299,7 +379,6 @@ const mobileBridgeCode = `/**
       updateTopBtnLabel();
     };
 
-    // 4. Collapse/Minimize toggle
     const toggleBtn = document.createElement('button');
     toggleBtn.textContent = '‹';
     toggleBtn.style.cssText = 'background:transparent;color:#94a3b8;border:none;padding:2px 5px;font-size:13px;cursor:pointer;';
@@ -324,13 +403,17 @@ const mobileBridgeCode = `/**
 
 fs.writeFileSync(path.join(DIST, 'mobile-bridge.js'), mobileBridgeCode, 'utf8');
 
-// 3. Inject <script src="./mobile-bridge.js"></script> into dist/index.html if not already present
+// 4. Inject mobile-bridge.js and await window.__wordcraftPreloadFonts() before WASM init in dist/index.html
 const indexHtmlPath = path.join(DIST, 'index.html');
 let html = fs.readFileSync(indexHtmlPath, 'utf8');
 if (!html.includes('mobile-bridge.js')) {
   html = html.replace('<head>', '<head>\n  <script src="./mobile-bridge.js"></script>');
-  fs.writeFileSync(indexHtmlPath, html, 'utf8');
-  console.log('✅ Injected mobile-bridge.js into dist/index.html');
-} else {
-  console.log('✅ Updated mobile-bridge.js in dist/');
 }
+if (!html.includes('__wordcraftPreloadFonts')) {
+  html = html.replace(
+    'const wasm = await init(',
+    'if (window.__wordcraftPreloadFonts) { try { await window.__wordcraftPreloadFonts(); } catch (e) { console.warn(e); } }\nconst wasm = await init('
+  );
+}
+fs.writeFileSync(indexHtmlPath, html, 'utf8');
+console.log('✅ Updated dist/index.html with Arabic font preloader and mobile-bridge.js');
