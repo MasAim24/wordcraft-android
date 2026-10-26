@@ -36,24 +36,82 @@ if (!hasWasm(DIST)) {
   console.log('✅ WordCraft Web WASM bundle already exists in dist/');
 }
 
-// 2. Write Android Mobile Bridge script (Virtual Keyboard, UI Scale, File Save & Share polyfill)
+// 2. Write Android Mobile Bridge script (DPI-aware UI Scale, Top Safe Margin toggle, Virtual Keyboard, File Save & Share)
 const mobileBridgeCode = `/**
- * WordCraft Android Mobile Bridge
- * - Polyfills window.showSaveFilePicker for Android WebView (Save / Export PDF / Export PNG -> Share or Download)
- * - Adds a collapsible floating Mobile Helper Pill (Keyboard focus, UI Zoom Scale, Orientation Lock)
+ * WordCraft Android Mobile Bridge v2
+ * - Fixes DPI scaling: WordCraft's uiScale is in physical pixels (pct / 100 / devicePixelRatio),
+ *   so relative percentages must be multiplied by window.devicePixelRatio!
+ * - Adds a toggleable Top Safe Margin ("⬇️ Atas") so the top menu/Ribbon is never blocked by status bar / camera cutout
+ * - Polyfills window.showSaveFilePicker for Android WebView
  */
 (function () {
   if (window.__wordcraftMobileBridgeLoaded) return;
   window.__wordcraftMobileBridgeLoaded = true;
 
-  // Set default compact UI scale (85%) on small mobile screens if not yet configured
+  const PREF_KEY = 'wordcraft.ui';
+  const TOP_OFFSET_KEY = 'wordcraft.android.topOffset';
+  const REL_SCALE_KEY = 'wordcraft.android.relScale';
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+
+  // Convert a relative UI scale (e.g. 75%, 85%, 100%) to WordCraft's physical-pixel uiScale (50..300 or "auto")
+  function toWordcraftScale(relPct) {
+    if (relPct === 100) return 'auto';
+    return Math.min(300, Math.max(50, Math.round(relPct * dpr)));
+  }
+
+  // Migrate/initialize UI scale so it isn't tiny on high-DPI mobile screens
   try {
-    const PREF_KEY = 'wordcraft.ui';
-    const existing = localStorage.getItem(PREF_KEY);
-    if (!existing && Math.min(window.innerWidth, window.innerHeight) < 600) {
-      localStorage.setItem(PREF_KEY, JSON.stringify({ uiScale: 85 }));
+    let savedRel = parseInt(localStorage.getItem(REL_SCALE_KEY) || '', 10);
+    let rawPrefs = {};
+    try {
+      rawPrefs = JSON.parse(localStorage.getItem(PREF_KEY) || '{}') || {};
+    } catch (_) {
+      rawPrefs = {};
+    }
+
+    // If previous v1 bridge wrote unscaled 75/85/100/115 on a high-DPI phone, fix it automatically
+    if (!savedRel || (typeof rawPrefs.uiScale === 'number' && rawPrefs.uiScale <= 115 && dpr > 1.5)) {
+      savedRel = 80; // 80% relative to native Android DPI: crisp, readable, and fits Ribbon nicely
+      localStorage.setItem(REL_SCALE_KEY, String(savedRel));
+      rawPrefs.uiScale = toWordcraftScale(savedRel);
+      localStorage.setItem(PREF_KEY, JSON.stringify(rawPrefs));
     }
   } catch (_) {}
+
+  // Apply Top Safe Margin so the top Title Bar & File/Home/Insert tabs are never blocked by Android status bar
+  function getTopOffset() {
+    const val = localStorage.getItem(TOP_OFFSET_KEY);
+    // Default to 28px safe top offset on mobile so top menu is always 100% clickable
+    return val === null ? 28 : (parseInt(val, 10) || 0);
+  }
+
+  function applyTopOffset(px) {
+    const canvas = document.getElementById('wordcraft_canvas');
+    if (!canvas) return;
+    let banner = document.getElementById('wc-top-safe-bar');
+    if (px > 0) {
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'wc-top-safe-bar';
+        banner.style.cssText = [
+          'position:fixed;top:0;left:0;right:0;z-index:99990;',
+          'background:#18181b;border-bottom:1px solid #27272a;',
+          'display:flex;align-items:center;justify-content:center;',
+          'color:#71717a;font:600 10px system-ui,sans-serif;user-select:none;'
+        ].join('');
+        document.body.appendChild(banner);
+      }
+      banner.style.height = px + 'px';
+      banner.style.display = 'flex';
+      canvas.style.top = px + 'px';
+      canvas.style.height = 'calc(100% - ' + px + 'px)';
+    } else {
+      if (banner) banner.style.display = 'none';
+      canvas.style.top = '0px';
+      canvas.style.height = '100%';
+    }
+    window.dispatchEvent(new Event('resize'));
+  }
 
   // Toast helper for saved/exported files
   function showSaveToast(filename, bytes, mime) {
@@ -91,7 +149,6 @@ const mobileBridgeCode = `/**
       } catch (err) {
         console.warn('navigator.share fallback:', err);
       }
-      // Fallback: data URL download
       const blob = new Blob([bytes], { type: mime || 'application/octet-stream' });
       const reader = new FileReader();
       reader.onload = () => {
@@ -132,7 +189,6 @@ const mobileBridgeCode = `/**
     return map[ext] || 'application/octet-stream';
   }
 
-  // Polyfill showSaveFilePicker for Android WebView so File > Save / Export works reliably
   if (typeof window.showSaveFilePicker !== 'function') {
     window.showSaveFilePicker = async function (opts) {
       const suggested = (opts && opts.suggestedName) ? opts.suggestedName : 'Document.docx';
@@ -169,18 +225,20 @@ const mobileBridgeCode = `/**
 
   // Build Floating Mobile Control Pill
   window.addEventListener('DOMContentLoaded', () => {
+    applyTopOffset(getTopOffset());
+
     const bar = document.createElement('div');
     bar.id = 'wc-mobile-pill';
     bar.style.cssText = [
-      'position:fixed;right:10px;bottom:10px;z-index:99998;',
-      'display:flex;align-items:center;gap:5px;background:rgba(15,23,42,0.82);',
+      'position:fixed;right:10px;bottom:24px;z-index:99998;',
+      'display:flex;align-items:center;gap:5px;background:rgba(15,23,42,0.86);',
       'backdrop-filter:blur(8px);padding:5px 8px;border-radius:999px;',
-      'border:1px solid rgba(255,255,255,0.16);box-shadow:0 4px 14px rgba(0,0,0,0.3);',
+      'border:1px solid rgba(255,255,255,0.18);box-shadow:0 4px 14px rgba(0,0,0,0.35);',
       'font:600 11px system-ui,sans-serif;color:#f8fafc;user-select:none;'
     ].join('');
 
     const btnStyle = [
-      'background:rgba(255,255,255,0.12);color:#f8fafc;border:none;border-radius:999px;',
+      'background:rgba(255,255,255,0.13);color:#f8fafc;border:none;border-radius:999px;',
       'padding:5px 9px;font:600 11px system-ui,sans-serif;cursor:pointer;'
     ].join('');
 
@@ -188,7 +246,6 @@ const mobileBridgeCode = `/**
     const kbBtn = document.createElement('button');
     kbBtn.textContent = '⌨️ Ketik';
     kbBtn.style.cssText = btnStyle;
-    kbBtn.title = 'Munculkan Keyboard Android';
     kbBtn.onclick = (e) => {
       e.stopPropagation();
       const input = document.getElementById('egui_text_agent') || document.querySelector('input, textarea');
@@ -201,49 +258,45 @@ const mobileBridgeCode = `/**
       }
     };
 
-    // 2. UI Scale cycle button (75% -> 85% -> 100% -> 115%)
+    // 2. Relative DPI UI Scale cycle button (65% -> 80% -> 90% -> 100%)
     const scaleBtn = document.createElement('button');
-    const scales = [75, 85, 100, 115];
-    function getSavedScale() {
-      try {
-        const parsed = JSON.parse(localStorage.getItem('wordcraft.ui') || '{}');
-        return typeof parsed.uiScale === 'number' ? parsed.uiScale : 85;
-      } catch (_) {
-        return 85;
-      }
+    const scales = [65, 80, 90, 100];
+    function getSavedRelScale() {
+      const v = parseInt(localStorage.getItem(REL_SCALE_KEY) || '80', 10);
+      return scales.includes(v) ? v : 80;
     }
-    scaleBtn.textContent = '🔍 ' + getSavedScale() + '%';
+    scaleBtn.textContent = '🔍 ' + getSavedRelScale() + '%';
     scaleBtn.style.cssText = btnStyle;
-    scaleBtn.title = 'Ubah Skala Ukuran UI';
     scaleBtn.onclick = (e) => {
       e.stopPropagation();
-      const cur = getSavedScale();
-      const next = scales[(scales.indexOf(cur) + 1) % scales.length] || 85;
+      const cur = getSavedRelScale();
+      const next = scales[(scales.indexOf(cur) + 1) % scales.length] || 80;
       try {
-        const parsed = JSON.parse(localStorage.getItem('wordcraft.ui') || '{}');
-        parsed.uiScale = next;
-        localStorage.setItem('wordcraft.ui', JSON.stringify(parsed));
+        localStorage.setItem(REL_SCALE_KEY, String(next));
+        const parsed = JSON.parse(localStorage.getItem(PREF_KEY) || '{}') || {};
+        parsed.uiScale = toWordcraftScale(next);
+        localStorage.setItem(PREF_KEY, JSON.stringify(parsed));
         location.reload();
       } catch (_) {}
     };
 
-    // 3. Fullscreen / Landscape toggle
-    const rotBtn = document.createElement('button');
-    rotBtn.textContent = '⛶ Layar';
-    rotBtn.style.cssText = btnStyle;
-    rotBtn.title = 'Toggle Layar Penuh / Landscape';
-    rotBtn.onclick = async (e) => {
+    // 3. Top Margin Safe-Area toggle (0px -> 28px -> 42px) so top menu is never covered by status bar
+    const topBtn = document.createElement('button');
+    const offsets = [0, 28, 42];
+    function updateTopBtnLabel() {
+      const cur = getTopOffset();
+      topBtn.textContent = cur === 0 ? '⬆️ Penuh' : ('⬇️ Atas ' + cur + 'px');
+    }
+    updateTopBtnLabel();
+    topBtn.style.cssText = btnStyle;
+    topBtn.title = 'Geser menu atas agar tidak tertutup status bar / poni kamera';
+    topBtn.onclick = (e) => {
       e.stopPropagation();
-      try {
-        if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
-          await document.documentElement.requestFullscreen();
-          if (screen.orientation && screen.orientation.lock) {
-            await screen.orientation.lock('landscape').catch(() => {});
-          }
-        } else if (document.exitFullscreen) {
-          await document.exitFullscreen();
-        }
-      } catch (_) {}
+      const cur = getTopOffset();
+      const next = offsets[(offsets.indexOf(cur) + 1) % offsets.length];
+      localStorage.setItem(TOP_OFFSET_KEY, String(next));
+      applyTopOffset(next);
+      updateTopBtnLabel();
     };
 
     // 4. Collapse/Minimize toggle
@@ -256,13 +309,13 @@ const mobileBridgeCode = `/**
       collapsed = !collapsed;
       kbBtn.style.display = collapsed ? 'none' : '';
       scaleBtn.style.display = collapsed ? 'none' : '';
-      rotBtn.style.display = collapsed ? 'none' : '';
+      topBtn.style.display = collapsed ? 'none' : '';
       toggleBtn.textContent = collapsed ? '⚙️' : '‹';
     };
 
     bar.appendChild(kbBtn);
     bar.appendChild(scaleBtn);
-    bar.appendChild(rotBtn);
+    bar.appendChild(topBtn);
     bar.appendChild(toggleBtn);
     document.body.appendChild(bar);
   });
@@ -278,4 +331,6 @@ if (!html.includes('mobile-bridge.js')) {
   html = html.replace('<head>', '<head>\n  <script src="./mobile-bridge.js"></script>');
   fs.writeFileSync(indexHtmlPath, html, 'utf8');
   console.log('✅ Injected mobile-bridge.js into dist/index.html');
+} else {
+  console.log('✅ Updated mobile-bridge.js in dist/');
 }
