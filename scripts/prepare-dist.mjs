@@ -51,9 +51,7 @@ if (!hasWasm(DIST)) {
   console.log('✅ WordCraft Web WASM bundle already exists in dist/');
 }
 
-// 2. Bundle Arabic fonts (Noto Sans Arabic + Amiri Regular/Bold) into dist/fonts/
-//    (Upstream wasm32 build skips embedding non-Georgian craft-fonts in crates/fonts/build.rs;
-//     pre-seeding them into IndexedDB "wordcraft" -> "fonts" makes FontDb::global() load them at startup!)
+// 2. Bundle Arabic fonts into dist/fonts/
 const distFontsDir = path.join(DIST, 'fonts');
 fs.mkdirSync(distFontsDir, { recursive: true });
 for (const font of ARABIC_FONTS) {
@@ -70,14 +68,15 @@ for (const font of ARABIC_FONTS) {
   }
 }
 
-// 3. Write Android Mobile Bridge script (Arabic Font Preloader, DPI-aware UI Scale, Top Safe Margin, Virtual Keyboard, File Save & Share)
+// 3. Write Android Mobile Bridge v4 (Full Native Java Bridge for Save, Save As, Open, Print, Clipboard, Arabic Fonts)
 const mobileBridgeCode = `/**
- * WordCraft Android Mobile Bridge v3
- * - Pre-seeds Noto Sans Arabic & Amiri into WordCraft's IndexedDB ("wordcraft" -> "fonts") BEFORE WASM boots
- *   so Arabic text & IME preedit render with full cursive shaping instead of tofu boxes
- * - Fixes DPI scaling: WordCraft's uiScale is in physical pixels (pct / 100 / devicePixelRatio)
- * - Adds a toggleable Top Safe Margin ("⬇️ Atas") so the top menu/Ribbon is never blocked by status bar
- * - Polyfills window.showSaveFilePicker for Android WebView
+ * WordCraft Android Mobile Bridge v4
+ * Connects WordCraft WebAssembly to Native Android (window.WordCraftAndroid in MainActivity.java):
+ * 1. Save / Save As / Export PDF / Export PNG -> Native MediaStore Downloads + Intent.ACTION_CREATE_DOCUMENT + Share
+ * 2. Open File / Insert Picture / Add Font -> Fixes Android WebView <input type="file" accept=".docx"> greyed-out files
+ * 3. File > Print -> Intercepts #wordcraft-print-frame blob PDF and saves/shares natively
+ * 4. Native Android Clipboard integration (Copy/Paste)
+ * 5. Pre-seeds Noto Sans Arabic & Amiri into IndexedDB ("wordcraft" -> "fonts")
  */
 (function () {
   if (window.__wordcraftMobileBridgeLoaded) return;
@@ -88,8 +87,231 @@ const mobileBridgeCode = `/**
   const REL_SCALE_KEY = 'wordcraft.android.relScale';
   const dpr = Math.max(1, window.devicePixelRatio || 1);
 
-  // Preload bundled Arabic fonts into IndexedDB ("wordcraft" -> objectStore "fonts") as Uint8Array
-  // Matches apps/wordcraft-web/src/web/font_store.rs exactly
+  // Convert Uint8Array to Base64 string safely in chunks
+  function uint8ToBase64(bytes) {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const sub = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+      binary += String.fromCharCode.apply(null, sub);
+    }
+    return btoa(binary);
+  }
+
+  function guessMime(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    const map = {
+      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      docm: 'application/vnd.ms-word.document.macroEnabled.12',
+      dotx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
+      pdf: 'application/pdf',
+      odt: 'application/vnd.oasis.opendocument.text',
+      rtf: 'application/rtf',
+      md: 'text/markdown',
+      txt: 'text/plain',
+      html: 'text/html',
+      htm: 'text/html',
+      xml: 'application/xml',
+      json: 'application/json',
+      png: 'image/png',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg'
+    };
+    return map[ext] || 'application/octet-stream';
+  }
+
+  // Central handler for all saved/exported/printed files
+  function handleNativeFileSave(filename, bytes, mime) {
+    const safeName = filename || 'Document1.docx';
+    const safeMime = mime || guessMime(safeName);
+    const b64 = uint8ToBase64(bytes);
+
+    // 1. Immediately save to /sdcard/Download/WordCraft/<safeName> via Native Java Bridge
+    if (window.WordCraftAndroid && typeof window.WordCraftAndroid.saveToDownloads === 'function') {
+      try {
+        window.WordCraftAndroid.saveToDownloads(b64, safeName, safeMime);
+      } catch (e) {
+        console.error('Native saveToDownloads error:', e);
+      }
+    }
+
+    // 2. Show action bar for "Save As (Pilih Folder)" and "Bagikan / Buka"
+    showSaveActionToast(safeName, b64, bytes, safeMime);
+  }
+
+  function showSaveActionToast(filename, b64, bytes, mime) {
+    let old = document.getElementById('wc-mobile-toast');
+    if (old) old.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'wc-mobile-toast';
+    toast.style.cssText = [
+      'position:fixed;bottom:76px;left:50%;transform:translateX(-50%);z-index:99999;',
+      'background:#0f172a;color:#f8fafc;padding:12px 14px;border-radius:14px;',
+      'box-shadow:0 12px 28px rgba(0,0,0,0.45);font:13px/1.4 system-ui,sans-serif;',
+      'display:flex;flex-wrap:wrap;align-items:center;gap:8px;max-width:94vw;',
+      'border:1px solid rgba(255,255,255,0.18);'
+    ].join('');
+
+    const label = document.createElement('div');
+    label.textContent = '✅ Tersimpan: Download/WordCraft/' + filename + ' (' + Math.max(1, Math.round(bytes.byteLength / 1024)) + ' KB)';
+    label.style.cssText = 'width:100%;font-weight:600;color:#4ade80;margin-bottom:2px;word-break:break-all;';
+    toast.appendChild(label);
+
+    // Button 1: Native Android "Save As..." folder chooser (Intent.ACTION_CREATE_DOCUMENT)
+    const pickerBtn = document.createElement('button');
+    pickerBtn.textContent = '📁 Pilih Folder (Save As)';
+    pickerBtn.style.cssText = [
+      'background:#2563eb;color:#fff;border:none;border-radius:8px;padding:7px 12px;',
+      'font:600 12px system-ui,sans-serif;cursor:pointer;'
+    ].join('');
+    pickerBtn.onclick = () => {
+      if (window.WordCraftAndroid && typeof window.WordCraftAndroid.saveWithSystemPicker === 'function') {
+        window.WordCraftAndroid.saveWithSystemPicker(b64, filename, mime);
+      }
+    };
+    toast.appendChild(pickerBtn);
+
+    // Button 2: Native Android Share / Open with other app
+    const shareBtn = document.createElement('button');
+    shareBtn.textContent = '📤 Bagikan / Buka';
+    shareBtn.style.cssText = [
+      'background:#059669;color:#fff;border:none;border-radius:8px;padding:7px 12px;',
+      'font:600 12px system-ui,sans-serif;cursor:pointer;'
+    ].join('');
+    shareBtn.onclick = () => {
+      if (window.WordCraftAndroid && typeof window.WordCraftAndroid.shareFile === 'function') {
+        window.WordCraftAndroid.shareFile(b64, filename, mime);
+      }
+    };
+    toast.appendChild(shareBtn);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕ Tutup';
+    closeBtn.style.cssText = [
+      'background:rgba(255,255,255,0.1);color:#cbd5e1;border:none;border-radius:8px;',
+      'padding:7px 10px;font:600 12px system-ui,sans-serif;cursor:pointer;margin-left:auto;'
+    ].join('');
+    closeBtn.onclick = () => toast.remove();
+    toast.appendChild(closeBtn);
+
+    document.body.appendChild(toast);
+    setTimeout(() => { if (toast.parentNode) toast.remove(); }, 20000);
+  }
+
+  // A. Always override window.showSaveFilePicker so Save / Save As / Export routes to Native Android
+  window.showSaveFilePicker = async function (opts) {
+    const suggested = (opts && opts.suggestedName) ? opts.suggestedName : 'Document1.docx';
+    const chunks = [];
+    return {
+      name: suggested,
+      async createWritable() {
+        return {
+          async write(data) {
+            if (data instanceof Uint8Array) {
+              chunks.push(new Uint8Array(data));
+            } else if (ArrayBuffer.isView(data)) {
+              chunks.push(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+            } else if (data instanceof ArrayBuffer) {
+              chunks.push(new Uint8Array(data));
+            } else if (data instanceof Blob) {
+              const ab = await data.arrayBuffer();
+              chunks.push(new Uint8Array(ab));
+            }
+          },
+          async close() {
+            const total = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+            const merged = new Uint8Array(total);
+            let offset = 0;
+            for (const c of chunks) {
+              merged.set(c, offset);
+              offset += c.byteLength;
+            }
+            handleNativeFileSave(suggested, merged, guessMime(suggested));
+          }
+        };
+      }
+    };
+  };
+
+  // B. Intercept <a download="..."> clicks AND <input type="file"> clicks
+  const origElementClick = HTMLElement.prototype.click;
+  HTMLElement.prototype.click = function () {
+    // 1. Fix <input type="file" accept=".docx,..."> on Android WebView
+    //    Android's ACTION_GET_CONTENT greys out files when given dot-extensions like ".docx" instead of MIME types
+    if (this.tagName === 'INPUT' && this.type === 'file') {
+      const accept = (this.getAttribute('accept') || '').toLowerCase();
+      if (accept.includes('.png') || accept.includes('.jpg')) {
+        this.setAttribute('accept', 'image/*');
+      } else if (accept.includes('.')) {
+        this.removeAttribute('accept');
+      }
+    }
+
+    // 2. Intercept <a href="blob:..." download="filename"> fallback downloads
+    if (this.tagName === 'A' && this.hasAttribute('download') && this.href && this.href.startsWith('blob:')) {
+      const dlName = this.getAttribute('download') || 'Document1.docx';
+      const blobUrl = this.href;
+      fetch(blobUrl)
+        .then((r) => r.arrayBuffer())
+        .then((ab) => {
+          handleNativeFileSave(dlName, new Uint8Array(ab), guessMime(dlName));
+        })
+        .catch((err) => console.error('Blob download intercept failed:', err));
+      return;
+    }
+
+    return origElementClick.apply(this, arguments);
+  };
+
+  // C. Intercept File > Print (#wordcraft-print-frame) so printing exports/shares PDF natively on Android
+  const observer = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node && node.id === 'wordcraft-print-frame' && node.tagName === 'IFRAME') {
+          const checkSrc = () => {
+            if (node.src && node.src.startsWith('blob:')) {
+              fetch(node.src)
+                .then((r) => r.arrayBuffer())
+                .then((ab) => {
+                  handleNativeFileSave('Document-Print.pdf', new Uint8Array(ab), 'application/pdf');
+                })
+                .catch(() => {});
+            }
+          };
+          setTimeout(checkSrc, 150);
+        }
+      }
+    }
+  });
+  window.addEventListener('DOMContentLoaded', () => {
+    if (document.body) {
+      observer.observe(document.body, { childList: true });
+    }
+  });
+
+  // D. Bridge navigator.clipboard to Native Android ClipboardManager
+  try {
+    if (navigator.clipboard) {
+      const origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+      navigator.clipboard.writeText = async function (text) {
+        if (window.WordCraftAndroid && typeof window.WordCraftAndroid.copyText === 'function') {
+          window.WordCraftAndroid.copyText(String(text || ''));
+        }
+        return origWriteText(text).catch(() => {});
+      };
+      const origReadText = navigator.clipboard.readText.bind(navigator.clipboard);
+      navigator.clipboard.readText = async function () {
+        if (window.WordCraftAndroid && typeof window.WordCraftAndroid.pasteText === 'function') {
+          const nativeText = window.WordCraftAndroid.pasteText();
+          if (nativeText) return nativeText;
+        }
+        return origReadText().catch(() => '');
+      };
+    }
+  } catch (_) {}
+
+  // E. Preload bundled Arabic fonts into IndexedDB ("wordcraft" -> objectStore "fonts")
   window.__wordcraftPreloadFonts = async function () {
     const BUNDLED_ARABIC_FONTS = [
       'NotoSansArabic-Regular.ttf',
@@ -136,10 +358,7 @@ const mobileBridgeCode = `/**
           req.onsuccess = () => resolve(true);
           req.onerror = () => resolve(false);
         });
-        console.info('[WordCraft Android] Pre-installed font into IndexedDB:', fontName);
-      } catch (e) {
-        console.warn('[WordCraft Android] Failed to preload font:', fontName, e);
-      }
+      } catch (_) {}
     }
     db.close();
   };
@@ -197,115 +416,6 @@ const mobileBridgeCode = `/**
       canvas.style.height = '100%';
     }
     window.dispatchEvent(new Event('resize'));
-  }
-
-  function showSaveToast(filename, bytes, mime) {
-    let old = document.getElementById('wc-mobile-toast');
-    if (old) old.remove();
-
-    const toast = document.createElement('div');
-    toast.id = 'wc-mobile-toast';
-    toast.style.cssText = [
-      'position:fixed;bottom:68px;left:50%;transform:translateX(-50%);z-index:99999;',
-      'background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:12px;',
-      'box-shadow:0 10px 25px rgba(0,0,0,0.35);font:13px/1.4 system-ui,sans-serif;',
-      'display:flex;align-items:center;gap:10px;max-width:92vw;border:1px solid rgba(255,255,255,0.14);'
-    ].join('');
-
-    const label = document.createElement('span');
-    label.textContent = '📄 ' + filename + ' (' + Math.max(1, Math.round(bytes.byteLength / 1024)) + ' KB)';
-    label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52vw;';
-    toast.appendChild(label);
-
-    const shareBtn = document.createElement('button');
-    shareBtn.textContent = 'Simpan / Bagikan';
-    shareBtn.style.cssText = [
-      'background:#2563eb;color:#fff;border:none;border-radius:8px;padding:6px 11px;',
-      'font:600 12px system-ui,sans-serif;cursor:pointer;white-space:nowrap;'
-    ].join('');
-    shareBtn.onclick = async () => {
-      try {
-        const file = new File([bytes], filename, { type: mime || 'application/octet-stream' });
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-          await navigator.share({ files: [file], title: filename });
-          toast.remove();
-          return;
-        }
-      } catch (err) {
-        console.warn('navigator.share fallback:', err);
-      }
-      const blob = new Blob([bytes], { type: mime || 'application/octet-stream' });
-      const reader = new FileReader();
-      reader.onload = () => {
-        const a = document.createElement('a');
-        a.href = reader.result;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      };
-      reader.readAsDataURL(blob);
-      toast.remove();
-    };
-    toast.appendChild(shareBtn);
-
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '✕';
-    closeBtn.style.cssText = 'background:transparent;color:#94a3b8;border:none;font-size:14px;padding:4px;cursor:pointer;';
-    closeBtn.onclick = () => toast.remove();
-    toast.appendChild(closeBtn);
-
-    document.body.appendChild(toast);
-    setTimeout(() => { if (toast.parentNode) toast.remove(); }, 15000);
-  }
-
-  function guessMime(name) {
-    const ext = (name.split('.').pop() || '').toLowerCase();
-    const map = {
-      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      pdf: 'application/pdf',
-      odt: 'application/vnd.oasis.opendocument.text',
-      rtf: 'application/rtf',
-      md: 'text/markdown',
-      txt: 'text/plain',
-      html: 'text/html',
-      png: 'image/png'
-    };
-    return map[ext] || 'application/octet-stream';
-  }
-
-  if (typeof window.showSaveFilePicker !== 'function') {
-    window.showSaveFilePicker = async function (opts) {
-      const suggested = (opts && opts.suggestedName) ? opts.suggestedName : 'Document.docx';
-      const chunks = [];
-      return {
-        name: suggested,
-        async createWritable() {
-          return {
-            async write(data) {
-              if (data instanceof Uint8Array) {
-                chunks.push(new Uint8Array(data));
-              } else if (ArrayBuffer.isView(data)) {
-                chunks.push(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-              } else if (data instanceof ArrayBuffer) {
-                chunks.push(new Uint8Array(data));
-              }
-            },
-            async close() {
-              const total = chunks.reduce((acc, c) => acc + c.byteLength, 0);
-              const merged = new Uint8Array(total);
-              let offset = 0;
-              for (const c of chunks) {
-                merged.set(c, offset);
-                offset += c.byteLength;
-              }
-              const mime = guessMime(suggested);
-              showSaveToast(suggested, merged, mime);
-            }
-          };
-        }
-      };
-    };
   }
 
   window.addEventListener('DOMContentLoaded', () => {
@@ -416,4 +526,4 @@ if (!html.includes('__wordcraftPreloadFonts')) {
   );
 }
 fs.writeFileSync(indexHtmlPath, html, 'utf8');
-console.log('✅ Updated dist/index.html with Arabic font preloader and mobile-bridge.js');
+console.log('✅ Updated dist/index.html with Native Android Bridge v4');
